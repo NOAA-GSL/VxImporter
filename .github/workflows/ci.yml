@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
   verify:
@@ -52,8 +53,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build Docker image
-        run: docker build -t vximporter:latest .
+        run: docker build -t ghcr.io/noaa-gsl/vximporter:main .
 
       - name: Install Trivy
         run: |
@@ -61,4 +69,7 @@ jobs:
           trivy --version
 
       - name: Trivy image scan (fail on HIGH/CRITICAL)
-        run: trivy image --exit-code 1 --severity CRITICAL,HIGH --ignore-unfixed vximporter:latest
+        run: trivy image --exit-code 1 --severity CRITICAL,HIGH --ignore-unfixed ghcr.io/noaa-gsl/vximporter:main
+
+      - name: Push Docker image to GHCR
+        run: docker push ghcr.io/noaa-gsl/vximporter:main
