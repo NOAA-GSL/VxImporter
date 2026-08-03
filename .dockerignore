@@ -1,0 +1,10 @@
+.git
+.history
+*.log
+*.tmp
+tmp/
+dist/
+bin/
+vximporter
+cb-importer
+*.jsonl

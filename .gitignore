@@ -30,3 +30,12 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Local history artifacts
+.history/
+
+# Project build outputs
+/vximporter
+/cbimporter
+/bin/
+/dist/
