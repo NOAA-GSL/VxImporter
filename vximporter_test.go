@@ -1,6 +1,9 @@
 package main
 
 import (
+	"compress/gzip"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -43,6 +46,26 @@ func TestExtractDocID_AcceptsNumericID(t *testing.T) {
 	}
 }
 
+func TestExtractDocID_RejectsNilID(t *testing.T) {
+	doc := map[string]interface{}{"id": nil}
+	_, ok := extractDocID(doc)
+	if ok {
+		t.Fatalf("expected nil id to be rejected")
+	}
+}
+
+func TestExtractDocID_AcceptsFloat64ID(t *testing.T) {
+	// JSON decoder unmarshals numbers as float64; ensure no scientific notation.
+	doc := map[string]interface{}{"id": float64(12345)}
+	got, ok := extractDocID(doc)
+	if !ok {
+		t.Fatalf("expected float64 id to be accepted")
+	}
+	if got != "12345" {
+		t.Fatalf("expected \"12345\", got %q", got)
+	}
+}
+
 func TestEnqueueJSONArrayBatches_StreamsAllDocuments(t *testing.T) {
 	input := `[{"id":"a"},{"id":"b"},{"id":"c"}]`
 	jobs := make(chan []map[string]interface{}, 4)
@@ -72,6 +95,58 @@ func TestEnqueueJSONArrayBatches_StreamsAllDocuments(t *testing.T) {
 	}
 }
 
+func TestEnqueueJSONArrayBatches_EmptyArray(t *testing.T) {
+	jobs := make(chan []map[string]interface{}, 1)
+	err := enqueueJSONArrayBatches(strings.NewReader(`[]`), 2, jobs)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	close(jobs)
+	if len(jobs) != 0 {
+		t.Fatalf("expected no jobs for empty array")
+	}
+}
+
+func TestEnqueueJSONArrayBatches_TrailingBatchFlushed(t *testing.T) {
+	// 3 docs with batchSize 10 — all land in one trailing batch.
+	input := `[{"id":"x"},{"id":"y"},{"id":"z"}]`
+	jobs := make(chan []map[string]interface{}, 4)
+
+	err := enqueueJSONArrayBatches(strings.NewReader(input), 10, jobs)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	close(jobs)
+
+	var total int
+	for batch := range jobs {
+		total += len(batch)
+	}
+	if total != 3 {
+		t.Fatalf("expected 3 docs, got %d", total)
+	}
+}
+
+func TestEnqueueJSONArrayBatches_ZeroBatchSizeClamped(t *testing.T) {
+	// batchSize <= 0 should be treated as 1, not panic or hang.
+	input := `[{"id":"a"},{"id":"b"}]`
+	jobs := make(chan []map[string]interface{}, 4)
+
+	err := enqueueJSONArrayBatches(strings.NewReader(input), 0, jobs)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	close(jobs)
+
+	var total int
+	for batch := range jobs {
+		total += len(batch)
+	}
+	if total != 2 {
+		t.Fatalf("expected 2 docs, got %d", total)
+	}
+}
+
 func TestEnqueueJSONArrayBatches_RejectsNonArrayInput(t *testing.T) {
 	err := enqueueJSONArrayBatches(strings.NewReader(`{"id":"x"}`), 2, make(chan []map[string]interface{}, 1))
 	if err == nil {
@@ -79,26 +154,56 @@ func TestEnqueueJSONArrayBatches_RejectsNonArrayInput(t *testing.T) {
 	}
 }
 
-func TestParseFlagsFromArgs_Defaults(t *testing.T) {
-	cfg := parseFlagsFromArgs([]string{})
+func TestOpenInputReader_GzipJSON(t *testing.T) {
+	tempDir := t.TempDir()
+	filePath := filepath.Join(tempDir, "input.json.gz")
 
-	if cfg.ConnStr != "couchbase://127.0.0.1" {
+	file, err := os.Create(filePath)
+	if err != nil {
+		t.Fatalf("create gzip file: %v", err)
+	}
+
+	gzipWriter := gzip.NewWriter(file)
+	if _, err := gzipWriter.Write([]byte(`[{"id":"gz-doc"}]`)); err != nil {
+		t.Fatalf("write gzip payload: %v", err)
+	}
+	if err := gzipWriter.Close(); err != nil {
+		t.Fatalf("close gzip writer: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	reader, err := openInputReader(filePath)
+	if err != nil {
+		t.Fatalf("openInputReader returned error: %v", err)
+	}
+	defer reader.Close()
+
+	jobs := make(chan []map[string]interface{}, 1)
+	if err := enqueueJSONArrayBatches(reader, 10, jobs); err != nil {
+		t.Fatalf("unexpected error decoding gz input: %v", err)
+	}
+	close(jobs)
+
+	total := 0
+	for batch := range jobs {
+		total += len(batch)
+	}
+	if total != 1 {
+		t.Fatalf("expected 1 document from gz input, got %d", total)
+	}
+}
+
+func TestParseFlagsFromArgs_Defaults(t *testing.T) {
+	t.Setenv("VX_CREDENTIALS_FILE", "/tmp/credentials-default.yaml")
+	cfg, err := parseFlagsFromArgs([]string{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.ConnStr != "/tmp/credentials-default.yaml" {
 		t.Fatalf("unexpected conn default: %q", cfg.ConnStr)
-	}
-	if cfg.Username != "Administrator" {
-		t.Fatalf("unexpected user default: %q", cfg.Username)
-	}
-	if cfg.Password != "password" {
-		t.Fatalf("unexpected pass default: %q", cfg.Password)
-	}
-	if cfg.BucketName != "default" {
-		t.Fatalf("unexpected bucket default: %q", cfg.BucketName)
-	}
-	if cfg.ScopeName != "_default" {
-		t.Fatalf("unexpected scope default: %q", cfg.ScopeName)
-	}
-	if cfg.CollectionName != "_default" {
-		t.Fatalf("unexpected collection default: %q", cfg.CollectionName)
 	}
 	if cfg.FilePath != "data.json" {
 		t.Fatalf("unexpected file default: %q", cfg.FilePath)
@@ -111,36 +216,31 @@ func TestParseFlagsFromArgs_Defaults(t *testing.T) {
 	}
 }
 
+func TestParseFlagsFromArgs_EnvVarDefaults(t *testing.T) {
+	t.Setenv("VX_CREDENTIALS_FILE", "/tmp/credentials-env.yaml")
+	cfg, err := parseFlagsFromArgs([]string{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ConnStr != "/tmp/credentials-env.yaml" {
+		t.Fatalf("expected VX_CREDENTIALS_FILE to set conn default, got %q", cfg.ConnStr)
+	}
+}
+
 func TestParseFlagsFromArgs_Overrides(t *testing.T) {
-	cfg := parseFlagsFromArgs([]string{
-		"-conn", "couchbase://cluster.local",
-		"-user", "alice",
-		"-pass", "secret",
-		"-bucket", "travel-sample",
-		"-scope", "inventory",
-		"-collection", "airline",
+	t.Setenv("VX_CREDENTIALS_FILE", "/tmp/credentials-env.yaml")
+	cfg, err := parseFlagsFromArgs([]string{
+		"-conn", "/tmp/credentials-override.yaml",
 		"-file", "input.json",
 		"-batch-size", "1000",
 		"-workers", "16",
 	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
-	if cfg.ConnStr != "couchbase://cluster.local" {
+	if cfg.ConnStr != "/tmp/credentials-override.yaml" {
 		t.Fatalf("unexpected conn value: %q", cfg.ConnStr)
-	}
-	if cfg.Username != "alice" {
-		t.Fatalf("unexpected user value: %q", cfg.Username)
-	}
-	if cfg.Password != "secret" {
-		t.Fatalf("unexpected pass value: %q", cfg.Password)
-	}
-	if cfg.BucketName != "travel-sample" {
-		t.Fatalf("unexpected bucket value: %q", cfg.BucketName)
-	}
-	if cfg.ScopeName != "inventory" {
-		t.Fatalf("unexpected scope value: %q", cfg.ScopeName)
-	}
-	if cfg.CollectionName != "airline" {
-		t.Fatalf("unexpected collection value: %q", cfg.CollectionName)
 	}
 	if cfg.FilePath != "input.json" {
 		t.Fatalf("unexpected file value: %q", cfg.FilePath)
@@ -150,5 +250,21 @@ func TestParseFlagsFromArgs_Overrides(t *testing.T) {
 	}
 	if cfg.NumWorkers != 16 {
 		t.Fatalf("unexpected workers value: %d", cfg.NumWorkers)
+	}
+}
+
+func TestParseFlagsFromArgs_MissingConnPathReturnsError(t *testing.T) {
+	t.Setenv("VX_CREDENTIALS_FILE", "")
+	_, err := parseFlagsFromArgs([]string{})
+	if err == nil {
+		t.Fatalf("expected error when conn path is missing")
+	}
+}
+
+func TestParseFlagsFromArgs_NonPositiveWorkersReturnsError(t *testing.T) {
+	t.Setenv("VX_CREDENTIALS_FILE", "/tmp/credentials.yaml")
+	_, err := parseFlagsFromArgs([]string{"-workers", "0"})
+	if err == nil {
+		t.Fatalf("expected error when workers <= 0")
 	}
 }

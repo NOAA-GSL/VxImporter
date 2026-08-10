@@ -51,6 +51,9 @@ func TestIntegration_UpsertAndGet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("upsert failed: %v", err)
 	}
+	t.Cleanup(func() {
+		_, _ = collection.Remove(docID, nil)
+	})
 
 	res, err := collection.Get(docID, nil)
 	if err != nil {

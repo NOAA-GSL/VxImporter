@@ -1,0 +1,18 @@
+services:
+  vximporter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vximporter:local
+    container_name: vximporter
+    working_dir: /app
+    volumes:
+      - ${HOME}/credentials:/run/config/credentials:ro
+      - ${VX_LOAD_DIR:?VX_LOAD_DIR is required}:/data/load
+      - ${VX_OUTPUT_PATH:?VX_OUTPUT_PATH is required}:/data/output
+    tmpfs:
+      - /data/tmp
+    environment:
+      VX_WORKERS: ${VX_WORKERS:-8}
+      # Increase when remote clusters need longer bucket readiness checks.
+      BUCKET_READY_TIMEOUT_SECONDS: ${BUCKET_READY_TIMEOUT_SECONDS:-60}
