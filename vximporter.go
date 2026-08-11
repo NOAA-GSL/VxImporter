@@ -1,6 +1,7 @@
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"flag"
@@ -8,27 +9,60 @@ import (
 	"io"
 	"log"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/couchbase/gocb/v2"
+	"gopkg.in/yaml.v3"
 )
 
-// Config contains runtime settings for the importer.
-//
+type compositeReadCloser struct {
+	io.Reader
+	closers []io.Closer
+}
+
+func (c compositeReadCloser) Close() error {
+	var firstErr error
+	for _, closer := range c.closers {
+		if err := closer.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// Credentials holds the Couchbase connection parameters read from the credentials YAML file.
+// Cb_timeout_seconds defaults to 3600 when zero or absent.
+type Credentials struct {
+	Cb_host            string `yaml:"cb_host"`
+	Cb_user            string `yaml:"cb_user"`
+	Cb_password        string `yaml:"cb_password"`
+	Cb_bucket          string `yaml:"cb_bucket"`
+	Cb_scope           string `yaml:"cb_scope"`
+	Cb_collection      string `yaml:"cb_collection"`
+	Cb_timeout_seconds int    `yaml:"cb_timeout_seconds"`
+}
+
 // Values are populated from CLI flags in parseFlags.
 type Config struct {
-	ConnStr        string
-	Username       string
-	Password       string
-	BucketName     string
-	ScopeName      string
-	CollectionName string
-	FilePath       string
-	BatchSize      int
-	NumWorkers     int
+	ConnStr    string
+	FilePath   string
+	BatchSize  int
+	NumWorkers int
+}
+
+// CbConnection bundles the live Couchbase handles needed for queries.
+// vxDBTARGET is the N1QL FROM target in "bucket.scope.collection" form.
+type CbConnection struct {
+	Cluster    *gocb.Cluster
+	Bucket     *gocb.Bucket
+	Scope      *gocb.Scope
+	Collection *gocb.Collection
+	vxDBTARGET string
 }
 
 // main wires together flag parsing, Couchbase connectivity, file streaming,
@@ -36,39 +70,26 @@ type Config struct {
 func main() {
 	// Parse CLI flags
 	cfg := parseFlags()
-
 	// 1. Connect to Couchbase Cluster
-	cluster, err := gocb.Connect(cfg.ConnStr, gocb.ClusterOptions{
-		Authenticator: gocb.PasswordAuthenticator{
-			Username: cfg.Username,
-			Password: cfg.Password,
-		},
-		// Optimize timeout & connections for heavy ingestion workloads
-		TimeoutsConfig: gocb.TimeoutsConfig{
-			KVTimeout: 10 * time.Second,
-		},
-	})
-	if err != nil {
-		log.Fatalf("Failed to connect to cluster: %v", err)
-	}
-	defer cluster.Close(nil)
+	credentials := getCredentials(cfg.ConnStr)
+	cbCon := getDbConnection(credentials)
+	defer cbCon.Cluster.Close(nil)
 
-	// Obtain handle to target collection
-	bucket := cluster.Bucket(cfg.BucketName)
-	if err := bucket.WaitUntilReady(5*time.Second, nil); err != nil {
-		log.Fatalf("Bucket ready check failed: %v", err)
-	}
-	collection := bucket.Scope(cfg.ScopeName).Collection(cfg.CollectionName)
+	// Obtain handle to target collection from credentials file values.
+	bucketName := credentials.Cb_bucket
+	scopeName := credentials.Cb_scope
+	collectionName := credentials.Cb_collection
+	collection := cbCon.Bucket.Scope(scopeName).Collection(collectionName)
 
 	// 2. Open File Stream
-	file, err := os.Open(cfg.FilePath)
+	file, err := openInputReader(cfg.FilePath)
 	if err != nil {
 		log.Fatalf("Failed to open file: %v", err)
 	}
 	defer file.Close()
 
-	log.Printf("Starting import into '%s.%s.%s' using %d workers (batch size: %d)...",
-		cfg.BucketName, cfg.ScopeName, cfg.CollectionName, cfg.NumWorkers, cfg.BatchSize)
+	log.Printf("Starting import into '%s.%s.%s' using %d workers (batch size: %d)... from filePath: %s",
+		bucketName, scopeName, collectionName, cfg.NumWorkers, cfg.BatchSize, cfg.FilePath)
 
 	start := time.Now()
 
@@ -92,13 +113,15 @@ func main() {
 	}
 
 	// 4. Producer: stream JSON array elements into batch jobs.
-	if err := enqueueJSONArrayBatches(file, cfg.BatchSize, jobs); err != nil {
-		log.Fatalf("Failed while decoding input file: %v", err)
-	}
+	encodeErr := enqueueJSONArrayBatches(file, cfg.BatchSize, jobs)
 	close(jobs)
 
-	// Wait for all workers to complete
+	// Wait for all workers to complete before reporting or exiting.
 	wg.Wait()
+
+	if encodeErr != nil {
+		log.Fatalf("Failed while decoding input file: %v", encodeErr)
+	}
 
 	duration := time.Since(start)
 	totalDocs := totalSuccess + totalFailed
@@ -109,6 +132,138 @@ func main() {
 	log.Printf("Successful:   %d docs", totalSuccess)
 	log.Printf("Failed:       %d docs", totalFailed)
 	log.Printf("Throughput:   %.2f ops/sec", opsPerSec)
+}
+
+// openInputReader opens the import file and transparently decompresses gzip input.
+func openInputReader(filePath string) (io.ReadCloser, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+
+	if !strings.HasSuffix(strings.ToLower(filePath), ".gz") {
+		return file, nil
+	}
+
+	gzipReader, err := gzip.NewReader(file)
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("open gzip reader: %w", err)
+	}
+
+	return compositeReadCloser{
+		Reader:  gzipReader,
+		closers: []io.Closer{gzipReader, file},
+	}, nil
+}
+
+// safeIdentRe restricts query parameter substitution to prevent SQL injection.
+var safeIdentRe = regexp.MustCompile(`^[a-zA-Z0-9_.:\-/]+$`)
+
+// validateQueryParam fatals if value contains characters outside [a-zA-Z0-9_.:\-/],
+// preventing SQL injection via template substitution.
+func validateQueryParam(name, value string) {
+	if value != "" && !safeIdentRe.MatchString(value) {
+		log.Fatalf("query parameter %q contains invalid characters: %q", name, value)
+	}
+}
+
+// getCredentials reads and YAML-decodes the credentials file.
+// It fatals if the file has permissions readable by group or others (mode & 0o077 != 0).
+func getCredentials(credentialsFilePath string) Credentials {
+	info, err := os.Stat(credentialsFilePath)
+	if err != nil {
+		log.Fatalf("unable to stat credentials file %q: %v", credentialsFilePath, err)
+	}
+	// reject credentials files readable by group or others
+	if info.Mode().Perm()&0o077 != 0 {
+		log.Fatalf("credentials file %q has insecure permissions %04o; chmod 600 to fix", credentialsFilePath, info.Mode().Perm())
+	}
+
+	creds := Credentials{}
+	yamlFile, err := os.ReadFile(credentialsFilePath)
+	if err != nil {
+		log.Fatalf("unable to read credentials file %q: %v", credentialsFilePath, err)
+	}
+	err = yaml.Unmarshal(yamlFile, &creds)
+	if err != nil {
+		log.Fatalf("Unmarshal: %v", err)
+	}
+	if creds.Cb_host == "" || creds.Cb_user == "" || creds.Cb_password == "" || creds.Cb_bucket == "" {
+		log.Fatal("credentials file missing required fields: cb_host, cb_user, cb_password, cb_bucket")
+	}
+	if creds.Cb_scope == "" {
+		creds.Cb_scope = "_default"
+	}
+	if creds.Cb_collection == "" {
+		creds.Cb_collection = "_default"
+	}
+	return creds
+}
+
+// getDbConnection opens a Couchbase cluster connection using the supplied credentials.
+// It waits up to a configurable timeout for the bucket to become ready before returning.
+func getDbConnection(cred Credentials) (conn CbConnection) {
+	log.Println("getDbConnection()")
+
+	conn = CbConnection{}
+	connectionString := cred.Cb_host
+	bucketName := cred.Cb_bucket
+	collection := cred.Cb_collection
+	username := cred.Cb_user
+	password := cred.Cb_password
+	timeout := cred.Cb_timeout_seconds
+	if timeout <= 0 {
+		timeout = 3600
+	}
+	options := gocb.ClusterOptions{
+		Authenticator: gocb.PasswordAuthenticator{
+			Username: username,
+			Password: password,
+		},
+		TimeoutsConfig: gocb.TimeoutsConfig{
+			QueryTimeout: time.Duration(timeout) * time.Second,
+		},
+	}
+
+	cluster, err := gocb.Connect(connectionString, options)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	conn.Cluster = cluster
+	conn.Bucket = conn.Cluster.Bucket(bucketName)
+	conn.Collection = conn.Bucket.Collection(collection)
+	conn.vxDBTARGET = cred.Cb_bucket + "." + cred.Cb_scope + "." + cred.Cb_collection
+	validateQueryParam("vxDBTARGET", conn.vxDBTARGET)
+
+	log.Println("vxDBTARGET:" + conn.vxDBTARGET)
+
+	err = conn.Bucket.WaitUntilReady(bucketReadyTimeout(), nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	conn.Scope = conn.Bucket.Scope(cred.Cb_scope)
+	return conn
+}
+
+// bucketReadyTimeout returns the wait duration for Bucket.WaitUntilReady.
+// BUCKET_READY_TIMEOUT_SECONDS can override the default for slower remote clusters.
+func bucketReadyTimeout() time.Duration {
+	seconds := 60
+	raw := strings.TrimSpace(os.Getenv("BUCKET_READY_TIMEOUT_SECONDS"))
+	if raw == "" {
+		return time.Duration(seconds) * time.Second
+	}
+
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed <= 0 {
+		log.Printf("invalid BUCKET_READY_TIMEOUT_SECONDS=%q, using default %d", raw, seconds)
+		return time.Duration(seconds) * time.Second
+	}
+
+	return time.Duration(parsed) * time.Second
 }
 
 // workerTask consumes document batches from jobs, enforces id-based keys,
@@ -226,27 +381,32 @@ func extractDocID(doc map[string]interface{}) (string, bool) {
 
 // parseFlags defines and parses CLI flags into a Config instance.
 func parseFlags() *Config {
-	return parseFlagsFromArgs(os.Args[1:])
+	cfg, err := parseFlagsFromArgs(os.Args[1:])
+	if err != nil {
+		log.Fatalf("Failed to parse flags: %v", err)
+	}
+	return cfg
 }
 
 // parseFlagsFromArgs defines and parses CLI flags from the provided args.
 //
 // A dedicated parser function enables deterministic unit tests without mutating
 // global process arguments.
-func parseFlagsFromArgs(args []string) *Config {
+func parseFlagsFromArgs(args []string) (*Config, error) {
 	cfg := &Config{}
 	fs := flag.NewFlagSet("vximporter", flag.ContinueOnError)
-	fs.StringVar(&cfg.ConnStr, "conn", "couchbase://127.0.0.1", "Couchbase connection string")
-	fs.StringVar(&cfg.Username, "user", "Administrator", "Database Username")
-	fs.StringVar(&cfg.Password, "pass", "password", "Database Password")
-	fs.StringVar(&cfg.BucketName, "bucket", "default", "Target Bucket")
-	fs.StringVar(&cfg.ScopeName, "scope", "_default", "Target Scope")
-	fs.StringVar(&cfg.CollectionName, "collection", "_default", "Target Collection")
+	fs.StringVar(&cfg.ConnStr, "conn", os.Getenv("VX_CREDENTIALS_FILE"), "Path to credentials YAML file (env: VX_CREDENTIALS_FILE)")
 	fs.StringVar(&cfg.FilePath, "file", "data.json", "Path to JSON array file")
 	fs.IntVar(&cfg.BatchSize, "batch-size", 500, "Documents per bulk request")
 	fs.IntVar(&cfg.NumWorkers, "workers", 8, "Number of concurrent goroutines")
 	if err := fs.Parse(args); err != nil {
-		log.Fatalf("Failed to parse flags: %v", err)
+		return nil, err
 	}
-	return cfg
+	if strings.TrimSpace(cfg.ConnStr) == "" {
+		return nil, fmt.Errorf("missing credentials file path; set -conn or VX_CREDENTIALS_FILE")
+	}
+	if cfg.NumWorkers <= 0 {
+		return nil, fmt.Errorf("invalid -workers value; must be greater than 0")
+	}
+	return cfg, nil
 }
