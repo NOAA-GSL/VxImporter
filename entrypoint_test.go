@@ -16,7 +16,6 @@ func TestEntrypoint_PassthroughArgs(t *testing.T) {
 	stubPath := writeImporterStub(t, tempDir, argsFile, "")
 
 	cmd := exec.Command("bash", "entrypoint.sh", "-conn", "/run/config/credentials", "-file", "/data/test.json.gz")
-	cmd.Dir = "/Users/randy.pierce/vxImporter"
 	cmd.Env = append(os.Environ(),
 		"VXIMPORTER_BIN="+stubPath,
 	)
@@ -43,7 +42,6 @@ func TestEntrypoint_AutoDetectSingleGzipFile(t *testing.T) {
 	writeGzipJSONFile(t, importGzipPath, `[{"id":"gz-doc"}]`)
 
 	cmd := exec.Command("bash", "entrypoint.sh")
-	cmd.Dir = "/Users/randy.pierce/vxImporter"
 	cmd.Env = append(os.Environ(),
 		"VXIMPORTER_BIN="+stubPath,
 		"CREDENTIALS_FILE="+credsPath,
@@ -101,7 +99,6 @@ func TestEntrypoint_AutoDetectArchiveWithGzipJSON(t *testing.T) {
 	writeTarGzWithFile(t, archivePath, "nested/data.json.gz", gzipJSONPayload(t, `[{"id":"archived"}]`))
 
 	cmd := exec.Command("bash", "entrypoint.sh")
-	cmd.Dir = "/Users/randy.pierce/vxImporter"
 	cmd.Env = append(os.Environ(),
 		"VXIMPORTER_BIN="+stubPath,
 		"CREDENTIALS_FILE="+credsPath,
