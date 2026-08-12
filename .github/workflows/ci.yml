@@ -112,6 +112,7 @@ jobs:
     needs: build-importer
     permissions:
       packages: read
+      security-events: write
     env:
       TRIVY_DISABLE_VEX_NOTICE: true
     steps:
