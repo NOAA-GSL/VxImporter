@@ -37,7 +37,7 @@ EOF
 docker build -t vximporter .
 docker run --rm \
   -v "${HOME}/credentials-test:/run/config/credentials:ro" \
-  -v "$(pwd)/data.json:/data/test.json:ro" \
+  -v "/tmp/data.json:/data/test.json:ro" \
   vximporter \
   -conn "/run/config/credentials" \
   -file "/data/test.json"
@@ -100,7 +100,7 @@ Run a single-file import:
 mkdir -p /tmp/vx-output
 export VX_LOAD_DIR=/tmp/vx-empty; export VX_OUTPUT_PATH=/tmp/vx-output \
   docker compose run --rm \
-    -v "$(pwd)/large_dataset.json:/data/import.json:ro" \
+    -v "$(pwd)/large_dataset.json:/data/large_dataset.json:ro" \
     --user "$(id -u):$(id -g)" \
     vximporter
 ```
@@ -159,7 +159,7 @@ Run with local file mount:
 ```bash
 docker run --rm \
   -v "${HOME}/credentials:/run/config/credentials:ro" \
-  -v "$(pwd)/large_dataset.json:/data/import.json:ro" \
+  -v "$(pwd)/large_dataset.json:/data/large_dataset.json:ro" \
   -v "$(pwd)/output:/data/output" \
   --tmpfs /data/tmp \
   --user "$(id -u):$(id -g)" \
@@ -241,6 +241,39 @@ Notes:
 | `-file`       | `data.json` | Input JSON array file path           |
 | `-batch-size` | `500`       | Number of documents per bulk request |
 | `-workers`    | `8`         | Number of concurrent workers         |
+
+## Environment Variables
+
+| Variable                       | Default | Description                                                                                                                                      |
+| ------------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `LOG_LEVEL`                    | `INFO`  | Controls logging verbosity. Supported values: `DEBUG`, `INFO`, `WARN`, `ERROR`. DEBUG logs file names being processed and empty data conditions. |
+| `VX_CREDENTIALS_FILE`          | `""`    | Alternative to `-conn` flag; sets the path to credentials YAML file                                                                              |
+| `BUCKET_READY_TIMEOUT_SECONDS` | `60`    | Timeout in seconds for waiting for Couchbase bucket to become ready. Useful for slower remote clusters.                                          |
+
+### Logging Levels
+
+- **DEBUG**: Very verbose. Logs every file name being processed, every document processed, empty data conditions, and successful individual document operations.
+- **INFO** (default): Logs import start/completion, connection establishment, file processing completion, successes/failures summary, and error conditions.
+- **WARN**: Only warnings and error conditions.
+- **ERROR**: Only error conditions.
+
+Example with DEBUG logging:
+
+```bash
+LOG_LEVEL=DEBUG ./vximporter \
+  -conn "${HOME}/credentials" \
+  -file "test.json"
+```
+
+Example with DEBUG logging in Docker:
+
+```bash
+docker run --rm \
+  -e LOG_LEVEL=DEBUG \
+  -v "${HOME}/credentials:/run/config/credentials:ro" \
+  -v "$(pwd)/large_dataset.json:/data/import.json:ro" \
+  vximporter:local
+```
 
 ## Input File Format
 
