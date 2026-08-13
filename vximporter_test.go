@@ -2,11 +2,18 @@ package main
 
 import (
 	"compress/gzip"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// testLogger returns a discarding logger for tests to avoid output pollution.
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
 
 func TestExtractDocID_UsesIDFieldFirst(t *testing.T) {
 	doc := map[string]interface{}{"id": "abc-123"}
@@ -70,7 +77,7 @@ func TestEnqueueJSONArrayBatches_StreamsAllDocuments(t *testing.T) {
 	input := `[{"id":"a"},{"id":"b"},{"id":"c"}]`
 	jobs := make(chan []map[string]interface{}, 4)
 
-	err := enqueueJSONArrayBatches(strings.NewReader(input), 2, jobs)
+	err := enqueueJSONArrayBatches(strings.NewReader(input), "test.json", 2, jobs, testLogger())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -97,7 +104,7 @@ func TestEnqueueJSONArrayBatches_StreamsAllDocuments(t *testing.T) {
 
 func TestEnqueueJSONArrayBatches_EmptyArray(t *testing.T) {
 	jobs := make(chan []map[string]interface{}, 1)
-	err := enqueueJSONArrayBatches(strings.NewReader(`[]`), 2, jobs)
+	err := enqueueJSONArrayBatches(strings.NewReader(`[]`), "test.json", 2, jobs, testLogger())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -112,7 +119,7 @@ func TestEnqueueJSONArrayBatches_TrailingBatchFlushed(t *testing.T) {
 	input := `[{"id":"x"},{"id":"y"},{"id":"z"}]`
 	jobs := make(chan []map[string]interface{}, 4)
 
-	err := enqueueJSONArrayBatches(strings.NewReader(input), 10, jobs)
+	err := enqueueJSONArrayBatches(strings.NewReader(input), "test.json", 10, jobs, testLogger())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -132,7 +139,7 @@ func TestEnqueueJSONArrayBatches_ZeroBatchSizeClamped(t *testing.T) {
 	input := `[{"id":"a"},{"id":"b"}]`
 	jobs := make(chan []map[string]interface{}, 4)
 
-	err := enqueueJSONArrayBatches(strings.NewReader(input), 0, jobs)
+	err := enqueueJSONArrayBatches(strings.NewReader(input), "test.json", 0, jobs, testLogger())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -148,7 +155,7 @@ func TestEnqueueJSONArrayBatches_ZeroBatchSizeClamped(t *testing.T) {
 }
 
 func TestEnqueueJSONArrayBatches_RejectsNonArrayInput(t *testing.T) {
-	err := enqueueJSONArrayBatches(strings.NewReader(`{"id":"x"}`), 2, make(chan []map[string]interface{}, 1))
+	err := enqueueJSONArrayBatches(strings.NewReader(`{"id":"x"}`), "test.json", 2, make(chan []map[string]interface{}, 1), testLogger())
 	if err == nil {
 		t.Fatalf("expected error for non-array input")
 	}
@@ -174,14 +181,14 @@ func TestOpenInputReader_GzipJSON(t *testing.T) {
 		t.Fatalf("close file: %v", err)
 	}
 
-	reader, err := openInputReader(filePath)
+	reader, err := openInputReader(filePath, testLogger())
 	if err != nil {
 		t.Fatalf("openInputReader returned error: %v", err)
 	}
 	defer reader.Close()
 
 	jobs := make(chan []map[string]interface{}, 1)
-	if err := enqueueJSONArrayBatches(reader, 10, jobs); err != nil {
+	if err := enqueueJSONArrayBatches(reader, filePath, 10, jobs, testLogger()); err != nil {
 		t.Fatalf("unexpected error decoding gz input: %v", err)
 	}
 	close(jobs)
