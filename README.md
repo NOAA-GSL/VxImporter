@@ -122,7 +122,7 @@ Required flags for `import_archive.sh`:
 | `-a` | Archive directory for processed tarballs         |
 | `-w` | Number of concurrent import workers (default: 8) |
 
-Credentials are read from `${HOME}/credentials` inside the container (configured in `docker-compose.yml`).
+Credentials are read from `${HOME}/credentials` inside the container (mounted by `import_archive.sh`).
 
 Credentials file format (YAML-style key: value):
 
@@ -144,7 +144,7 @@ Example:
   -w 8
 ```
 
-The script can be run from any directory. `docker-compose.yml` is resolved relative to the script's own location.
+The script can be run from any directory. It executes `docker run` against the local image tag `vximporter:local`.
 
 ## Docker
 

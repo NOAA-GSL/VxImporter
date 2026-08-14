@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # Host-side launcher: runs the vximporter container to process archives.
-# Credentials come from ${HOME}/credentials per docker-compose.yml.
+# Credentials come from ${HOME}/credentials mounted at /run/config/credentials.
 
 export TZ="UTC0"
-SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 
 function usage {
     echo "Usage: $0 -l load_dir -a archive_dir [-w workers]" >&2
@@ -24,28 +23,28 @@ number_of_workers=8
 
 while getopts 'a:l:w:' param; do
     case "${param}" in
-    a)
-        archive_dir=$(strip_trailing_slash "${OPTARG}")
-        if [[ ! -d "${archive_dir}" ]]; then
-            echo "ERROR: archive directory ${archive_dir} does not exist" >&2
-            usage
-        fi
+        a)
+            archive_dir=$(strip_trailing_slash "${OPTARG}")
+            if [[ ! -d "${archive_dir}" ]]; then
+                echo "ERROR: archive directory ${archive_dir} does not exist" >&2
+                usage
+            fi
         ;;
-    l)
-        load_dir=$(strip_trailing_slash "${OPTARG}")
-        if [[ ! -d "${load_dir}" ]]; then
-            echo "ERROR: load directory ${load_dir} does not exist" >&2
-            usage
-        fi
+        l)
+            load_dir=$(strip_trailing_slash "${OPTARG}")
+            if [[ ! -d "${load_dir}" ]]; then
+                echo "ERROR: load directory ${load_dir} does not exist" >&2
+                usage
+            fi
         ;;
-    w)
-        number_of_workers=${OPTARG}
-        if ! [[ "${number_of_workers}" =~ ^[1-9][0-9]*$ ]]; then
-            echo "ERROR: workers must be a positive integer" >&2
-            usage
-        fi
+        w)
+            number_of_workers=${OPTARG}
+            if ! [[ "${number_of_workers}" =~ ^[1-9][0-9]*$ ]]; then
+                echo "ERROR: workers must be a positive integer" >&2
+                usage
+            fi
         ;;
-    *)
+        *)
         usage ;;
     esac
 done
@@ -70,12 +69,15 @@ fi
 # entrypoint.sh processes all tarballs in load_dir, moves them to archive_dir,
 # and exits 0 if any succeeded, 1 if all failed, 2 if nothing to process.
 container_exit=0
-VX_LOAD_DIR="${load_dir}" \
-VX_OUTPUT_PATH="${archive_dir}" \
-VX_WORKERS="${number_of_workers}" \
-docker compose -f "${SCRIPT_DIR}/docker-compose.yml" run --rm \
-    --user "$(id -u):$(id -g)" \
-    vximporter || container_exit=$?
+docker run --rm \
+-v "${HOME}/credentials:/run/config/credentials:ro" \
+-v "${load_dir}:/data/load" \
+-v "${archive_dir}:/data/output" \
+--tmpfs /data/tmp \
+-e VX_WORKERS="${number_of_workers}" \
+-e BUCKET_READY_TIMEOUT_SECONDS="${BUCKET_READY_TIMEOUT_SECONDS:-60}" \
+--user "$(id -u):$(id -g)" \
+vximporter:local || container_exit=$?
 
 # there are multiple exit codes from the container: 0 = at least one import succeeded, 1 = all failed, 2 = nothing to do
 case "${container_exit}" in
