@@ -137,6 +137,8 @@ func main() {
 	// Counters are aggregated across all workers.
 	var totalSuccess uint64
 	var totalFailed uint64
+	var successfulDocIDs []string
+	var successfulDocIDsMu sync.Mutex
 
 	// 3. Start Worker Pool
 	var wg sync.WaitGroup
@@ -144,9 +146,14 @@ func main() {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			s, f := workerTask(collection, jobs, logger)
+			s, f, ids := workerTask(collection, jobs, logger)
 			atomic.AddUint64(&totalSuccess, s)
 			atomic.AddUint64(&totalFailed, f)
+			if len(ids) > 0 {
+				successfulDocIDsMu.Lock()
+				successfulDocIDs = append(successfulDocIDs, ids...)
+				successfulDocIDsMu.Unlock()
+			}
 		}(w)
 	}
 
@@ -156,6 +163,7 @@ func main() {
 
 	// Wait for all workers to complete before reporting or exiting.
 	wg.Wait()
+	logSuccessfulDocIDs(logger, successfulDocIDs, os.Stderr)
 
 	if encodeErr != nil {
 		logger.Error("Failed while decoding input file", "filePath", cfg.FilePath, "error", encodeErr)
@@ -167,6 +175,20 @@ func main() {
 	opsPerSec := float64(totalDocs) / duration.Seconds()
 
 	logger.Info("Import Complete", "timeElapsed", duration, "successful", totalSuccess, "failed", totalFailed, "throughput", fmt.Sprintf("%.2f ops/sec", opsPerSec))
+}
+
+func logSuccessfulDocIDs(logger *slog.Logger, docIDs []string, out io.Writer) {
+	if !logger.Enabled(context.Background(), slog.LevelDebug) {
+		return
+	}
+
+	logger.Debug("Successfully upserted document IDs", "count", len(docIDs))
+	encodedDocIDs, err := json.MarshalIndent(docIDs, "", "  ")
+	if err != nil {
+		logger.Debug("Unable to pretty print upserted document IDs", "error", err)
+		return
+	}
+	fmt.Fprintln(out, string(encodedDocIDs))
 }
 
 // openInputReader opens the import file and transparently decompresses gzip input.
@@ -317,8 +339,9 @@ func bucketReadyTimeout() time.Duration {
 
 // workerTask consumes document batches from jobs, enforces id-based keys,
 // performs a bulk upsert, and returns per-worker success/failure counters.
-func workerTask(collection *gocb.Collection, jobs <-chan []map[string]interface{}, logger *slog.Logger) (uint64, uint64) {
+func workerTask(collection *gocb.Collection, jobs <-chan []map[string]interface{}, logger *slog.Logger) (uint64, uint64, []string) {
 	var successCount, failCount uint64
+	successfulDocIDs := []string{}
 
 	for batch := range jobs {
 		ops := make([]gocb.BulkOp, 0, len(batch))
@@ -358,12 +381,13 @@ func workerTask(collection *gocb.Collection, jobs <-chan []map[string]interface{
 				failCount++
 			} else {
 				logger.Debug("Document upserted successfully", "docID", upsertOp.ID)
+				successfulDocIDs = append(successfulDocIDs, upsertOp.ID)
 				successCount++
 			}
 		}
 	}
 
-	return successCount, failCount
+	return successCount, failCount, successfulDocIDs
 }
 
 // enqueueJSONArrayBatches validates that the input is a JSON array and streams

@@ -252,7 +252,7 @@ Notes:
 
 ### Logging Levels
 
-- **DEBUG**: Very verbose. Logs every file name being processed, every document processed, empty data conditions, and successful individual document operations.
+- **DEBUG**: Very verbose. Logs every file name being processed, every document processed, empty data conditions, successful individual document operations, and a pretty-printed list of successfully upserted document IDs.
 - **INFO** (default): Logs import start/completion, connection establishment, file processing completion, successes/failures summary, and error conditions.
 - **WARN**: Only warnings and error conditions.
 - **ERROR**: Only error conditions.

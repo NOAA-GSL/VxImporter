@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
 	"io"
 	"log/slog"
@@ -13,6 +14,29 @@ import (
 // testLogger returns a discarding logger for tests to avoid output pollution.
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func TestLogSuccessfulDocIDs_DebugPrettyPrints(t *testing.T) {
+	var out bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	logSuccessfulDocIDs(logger, []string{"doc-a", "doc-b"}, &out)
+
+	want := "[\n  \"doc-a\",\n  \"doc-b\"\n]\n"
+	if out.String() != want {
+		t.Fatalf("unexpected pretty printed IDs:\nwant %q\n got %q", want, out.String())
+	}
+}
+
+func TestLogSuccessfulDocIDs_InfoSuppressesList(t *testing.T) {
+	var out bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	logSuccessfulDocIDs(logger, []string{"doc-a"}, &out)
+
+	if out.Len() != 0 {
+		t.Fatalf("expected INFO level to suppress document ID list, got %q", out.String())
+	}
 }
 
 func TestExtractDocID_UsesIDFieldFirst(t *testing.T) {
