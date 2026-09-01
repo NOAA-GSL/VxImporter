@@ -56,7 +56,12 @@ fi
 
 # Concurrency guard: refuse if more than 10 instances already running.
 if command -v pgrep >/dev/null 2>&1; then
-    running_jobs=$(pgrep -fc "$(basename "$0")")
+    # BSD pgrep (macOS) lacks -c; count matches from stdout instead.
+    if pgrep -f "$(basename "$0")" >/dev/null 2>&1; then
+        running_jobs=$(pgrep -f "$(basename "$0")" | wc -l | awk '{print $1}')
+    else
+        running_jobs=0
+    fi
 else
     running_jobs=$(ps -elf | grep "$(basename "$0")" | grep -v grep | wc -l)
 fi
@@ -77,7 +82,9 @@ docker run --rm \
 -e VX_WORKERS="${number_of_workers}" \
 -e BUCKET_READY_TIMEOUT_SECONDS="${BUCKET_READY_TIMEOUT_SECONDS:-60}" \
 --user "$(id -u):$(id -g)" \
-vximporter:local || container_exit=$?
+--pull always \
+--name vximporter \
+ghcr.io/noaa-gsl/vximporter:latest || container_exit=$?
 
 # there are multiple exit codes from the container: 0 = at least one import succeeded, 1 = all failed, 2 = nothing to do
 case "${container_exit}" in
