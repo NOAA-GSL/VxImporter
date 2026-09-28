@@ -49,6 +49,7 @@ docker run --rm \
 - Uses concurrent workers for improved ingestion throughput.
 - Executes bulk upsert operations with Couchbase Go SDK v2.
 - Uses the `id` field of each document as the Couchbase document key.
+- Publishes a shared Couchbase import lock while documents are being written.
 - Emits summary metrics (successes, failures, elapsed time, throughput).
 
 ## Requirements
@@ -235,20 +236,88 @@ Notes:
 
 ## CLI Flags
 
-| Flag          | Default     | Description                          |
-| ------------- | ----------- | ------------------------------------ |
-| `-conn`       | `""`        | Path to credentials YAML file        |
-| `-file`       | `data.json` | Input JSON array file path           |
-| `-batch-size` | `500`       | Number of documents per bulk request |
-| `-workers`    | `8`         | Number of concurrent workers         |
+| Flag          | Default     | Description                                                                  |
+| ------------- | ----------- | ---------------------------------------------------------------------------- |
+| `-conn`       | `""`        | Path to credentials YAML file                                                |
+| `-file`       | `data.json` | Input JSON array file path                                                   |
+| `-collection` | `""`        | Couchbase collection name; overrides `cb_collection` in the credentials file |
+| `-batch-size` | `500`       | Number of documents per bulk request                                         |
+| `-workers`    | `8`         | Number of concurrent workers                                                 |
 
 ## Environment Variables
 
-| Variable                       | Default | Description                                                                                                                                      |
-| ------------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `LOG_LEVEL`                    | `INFO`  | Controls logging verbosity. Supported values: `DEBUG`, `INFO`, `WARN`, `ERROR`. DEBUG logs file names being processed and empty data conditions. |
-| `VX_CREDENTIALS_FILE`          | `""`    | Alternative to `-conn` flag; sets the path to credentials YAML file                                                                              |
-| `BUCKET_READY_TIMEOUT_SECONDS` | `60`    | Timeout in seconds for waiting for Couchbase bucket to become ready. Useful for slower remote clusters.                                          |
+| Variable                       | Default    | Description                                                                                                                                      |
+| ------------------------------ | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `LOG_LEVEL`                    | `INFO`     | Controls logging verbosity. Supported values: `DEBUG`, `INFO`, `WARN`, `ERROR`. DEBUG logs file names being processed and empty data conditions. |
+| `VX_CREDENTIALS_FILE`          | `""`       | Alternative to `-conn` flag; sets the path to credentials YAML file                                                                              |
+| `BUCKET_READY_TIMEOUT_SECONDS` | `60`       | Timeout in seconds for waiting for Couchbase bucket to become ready. Useful for slower remote clusters.                                          |
+| `DURABILITY_LEVEL`             | `majority` | Durability applied to each document upsert: `none`, `majority`, `majorityAndPersistOnMaster`, or `persistToMajority`.                            |
+
+## Import Lock and Couchbase Readiness
+
+VxImporter coordinates with VxIngest through one lock document in the target
+bucket's default scope and `COMMON` collection:
+
+```text
+MD:import_lock:COMMON:V01
+```
+
+The lock document has this shape:
+
+```json
+{
+  "id": "MD:import_lock:COMMON:V01",
+  "status": "running",
+  "updated": 1760000000,
+  "job_id": "vximporter:hostname:12345"
+}
+```
+
+`job_id` combines the host name and process ID so operators can identify the
+importer that owns the lock. `updated` is a Unix timestamp in seconds.
+
+### Importer lifecycle
+
+1. VxImporter connects to Couchbase and waits for the target bucket to become
+  ready. The wait defaults to 60 seconds and is controlled by
+  `BUCKET_READY_TIMEOUT_SECONDS`.
+2. It attempts to acquire the lock before starting document writes. A missing
+  lock document is created with `status="running"`. An existing `idle`
+  document is changed to `running` with a CAS-protected replacement.
+3. If the lock already has `status="running"`, the importer waits and polls
+  every 10 seconds for the previous import to finish. It waits for up to 30
+  minutes. A heartbeat older than 30 minutes is considered stale and can be
+  reclaimed with CAS.
+4. While importing, VxImporter refreshes `updated` and keeps `status="running"`
+  every minute.
+5. On normal completion, input failure, or another deferred exit path, the
+  heartbeat is stopped and the lock is set to `status="idle"`.
+
+The lock is a coordination marker, not a document-level transaction. It does
+not roll back documents already written if an import fails. A process killed
+before deferred cleanup can leave a stale `running` document; VxIngest's reader
+side has a stale-lock policy, described below. Inspect `job_id` and `updated`
+before manually changing a lock.
+
+### Reader wait behavior in VxIngest
+
+VxIngest builders that read documents written by VxImporter check this document
+before reading the dataset. They poll every 10 seconds while the status is
+`running`. They stop waiting and proceed when:
+
+- the document is absent;
+- the status is not `running` (normally `idle`);
+- the `updated` timestamp is more than 30 minutes old;
+- the lock cannot be read; or
+- the total wait reaches 30 minutes.
+
+The reader-side behavior is intentionally fail-open: a lock read error or an
+expired/stale lock does not prevent the builder from running. This avoids
+blocking ingestion indefinitely when Couchbase is unavailable or an importer
+container was terminated. A fresh `running` lock is still honored, so normal
+imports give queued importers and VxIngest time to finish before downstream
+calculations read the data. If the previous importer remains active beyond the
+30-minute wait, the queued importer exits rather than running concurrently.
 
 ### Logging Levels
 

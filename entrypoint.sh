@@ -43,6 +43,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Ignore stop/interrupt signals so an in-progress import always runs to
+# completion instead of being cut short by `docker stop`/`docker-compose down`.
+# A forced SIGKILL (after the stop grace period) can still terminate it.
+trap '' SIGTERM SIGINT
+
 build_runtime_creds() {
     local cb_host="" cb_user="" cb_pwd="" bucket="" scope="" collection="" timeout=""
 
@@ -94,9 +99,14 @@ build_runtime_creds() {
 build_runtime_creds
 
 run_import() {
+    local collection="${2:-}"
+    if [[ -z "${collection}" ]]; then
+        collection=$(get_credential_value cb_collection "${CREDS}")
+    fi
     "${VXIMPORTER_BIN}" \
     -conn "${CREDS}" \
     -file "$1" \
+    -collection "${collection}" \
     -workers "${WORKERS}" \
     -batch-size "${BATCH_SIZE}"
 }

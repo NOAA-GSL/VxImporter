@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -52,6 +53,7 @@ type Credentials struct {
 type Config struct {
 	ConnStr    string
 	FilePath   string
+	Collection string
 	BatchSize  int
 	NumWorkers int
 }
@@ -98,6 +100,26 @@ type CbConnection struct {
 	vxDBTARGET string
 }
 
+const (
+	importLockDocID             = "MD:import_lock:COMMON:V01"
+	importLockCollectionName    = "COMMON"
+	importLockHeartbeatInterval = time.Minute
+	importLockPollInterval      = 10 * time.Second
+	importLockMaxWait           = 30 * time.Minute
+	importLockStaleAfter        = 30 * time.Minute
+)
+
+type importLockWriter interface {
+	Upsert(id string, value interface{}, opts *gocb.UpsertOptions) (*gocb.MutationResult, error)
+}
+
+type importLockStore interface {
+	importLockWriter
+	Get(id string, opts *gocb.GetOptions) (*gocb.GetResult, error)
+	Insert(id string, value interface{}, opts *gocb.InsertOptions) (*gocb.MutationResult, error)
+	Replace(id string, value interface{}, opts *gocb.ReplaceOptions) (*gocb.MutationResult, error)
+}
+
 // main wires together flag parsing, Couchbase connectivity, file streaming,
 // worker scheduling, and final import metrics.
 func main() {
@@ -106,17 +128,21 @@ func main() {
 
 	// Parse CLI flags
 	cfg := parseFlags()
-	logger.Debug("Configuration loaded", "connStr", cfg.ConnStr, "filePath", cfg.FilePath, "batchSize", cfg.BatchSize, "numWorkers", cfg.NumWorkers)
+	logger.Debug("Configuration loaded", "connStr", cfg.ConnStr, "filePath", cfg.FilePath, "collection", cfg.Collection, "batchSize", cfg.BatchSize, "numWorkers", cfg.NumWorkers)
 
 	// 1. Connect to Couchbase Cluster
 	credentials := getCredentials(cfg.ConnStr, logger)
+	if cfg.Collection != "" {
+		credentials.Cb_collection = cfg.Collection
+	}
 	cbCon := getDbConnection(credentials, logger)
+	collectionName := credentials.Cb_collection
+	logger.Debug("Using collection name", "collectionName", collectionName)
 	defer cbCon.Cluster.Close(nil)
 
 	// Obtain handle to target collection from credentials file values.
 	bucketName := credentials.Cb_bucket
 	scopeName := credentials.Cb_scope
-	collectionName := credentials.Cb_collection
 	collection := cbCon.Bucket.Scope(scopeName).Collection(collectionName)
 
 	// 2. Open File Stream
@@ -127,7 +153,27 @@ func main() {
 	}
 	defer file.Close()
 
-	logger.Info("Starting import", "bucket", bucketName, "scope", scopeName, "collection", collectionName, "workers", cfg.NumWorkers, "batchSize", cfg.BatchSize, "filePath", cfg.FilePath)
+	importLockCollection := cbCon.Bucket.Collection(importLockCollectionName)
+	hostName, err := os.Hostname()
+	if err != nil {
+		logger.Error("Failed to determine hostname for import lock", "error", err)
+		return
+	}
+	importJobID := fmt.Sprintf("vximporter:%s:%d", hostName, os.Getpid())
+	if err := acquireImportLock(importLockCollection, importJobID); err != nil {
+		logger.Error("Failed to acquire import lock", "error", err)
+		return
+	}
+	stopImportLockHeartbeat := startImportLockHeartbeat(importLockCollection, importJobID, logger)
+	defer func() {
+		stopImportLockHeartbeat()
+		if err := updateImportLock(importLockCollection, "idle", importJobID); err != nil {
+			logger.Error("Failed to release import lock", "error", err)
+		}
+	}()
+
+	durabilityLevel := durabilityLevelFromEnv(logger)
+	logger.Info("Starting import", "bucket", bucketName, "scope", scopeName, "collection", collectionName, "workers", cfg.NumWorkers, "batchSize", cfg.BatchSize, "filePath", cfg.FilePath, "durabilityLevel", durabilityLevel)
 
 	start := time.Now()
 
@@ -146,7 +192,7 @@ func main() {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			s, f, ids := workerTask(collection, jobs, logger)
+			s, f, ids := workerTask(collection, jobs, durabilityLevel, logger)
 			atomic.AddUint64(&totalSuccess, s)
 			atomic.AddUint64(&totalFailed, f)
 			if len(ids) > 0 {
@@ -167,7 +213,7 @@ func main() {
 
 	if encodeErr != nil {
 		logger.Error("Failed while decoding input file", "filePath", cfg.FilePath, "error", encodeErr)
-		log.Fatalf("Failed while decoding input file: %v", encodeErr)
+		return
 	}
 
 	duration := time.Since(start)
@@ -175,6 +221,109 @@ func main() {
 	opsPerSec := float64(totalDocs) / duration.Seconds()
 
 	logger.Info("Import Complete", "timeElapsed", duration, "successful", totalSuccess, "failed", totalFailed, "throughput", fmt.Sprintf("%.2f ops/sec", opsPerSec))
+}
+
+var errImportLockWaitTimeout = errors.New("timed out waiting for the previous import to finish")
+
+func acquireImportLock(collection importLockStore, jobID string) error {
+	return acquireImportLockWithTiming(collection, jobID, importLockPollInterval, importLockMaxWait, time.Now, slog.Default())
+}
+
+func acquireImportLockWithTiming(collection importLockStore, jobID string, pollInterval, maxWait time.Duration, now func() time.Time, logger *slog.Logger) error {
+	lockValue := importLockValue("running", jobID)
+	deadline := now().Add(maxWait)
+	for {
+		result, err := collection.Get(importLockDocID, nil)
+		if errors.Is(err, gocb.ErrDocumentNotFound) {
+			_, err = collection.Insert(importLockDocID, lockValue, nil)
+			if errors.Is(err, gocb.ErrDocumentExists) {
+				continue
+			}
+			return err
+		}
+		if err != nil {
+			return err
+		}
+
+		var current map[string]interface{}
+		if err := result.Content(&current); err != nil {
+			return fmt.Errorf("decode import lock: %w", err)
+		}
+		status, _ := current["status"].(string)
+		if importLockIsAvailable(status) || importLockIsStale(current, now()) {
+			_, err = collection.Replace(importLockDocID, lockValue, &gocb.ReplaceOptions{Cas: result.Cas()})
+			if errors.Is(err, gocb.ErrCasMismatch) {
+				continue
+			}
+			return err
+		}
+
+		if !now().Before(deadline) {
+			return errImportLockWaitTimeout
+		}
+		logger.Info("Import lock is held, waiting for previous import", "jobID", current["job_id"], "pollInterval", pollInterval, "maxWait", maxWait)
+		time.Sleep(pollInterval)
+	}
+}
+
+func importLockIsAvailable(status string) bool {
+	return status == "idle"
+}
+
+func importLockIsStale(lock map[string]interface{}, now time.Time) bool {
+	if status, _ := lock["status"].(string); status != "running" {
+		return false
+	}
+	var updated int64
+	switch value := lock["updated"].(type) {
+	case int64:
+		updated = value
+	case float64:
+		updated = int64(value)
+	default:
+		return true
+	}
+	return now.Sub(time.Unix(updated, 0)) > importLockStaleAfter
+}
+
+func importLockValue(status, jobID string) map[string]interface{} {
+	return map[string]interface{}{
+		"id":      importLockDocID,
+		"status":  status,
+		"updated": time.Now().Unix(),
+		"job_id":  jobID,
+	}
+}
+
+func updateImportLock(collection importLockWriter, status, jobID string) error {
+	_, err := collection.Upsert(importLockDocID, importLockValue(status, jobID), nil)
+	return err
+}
+
+func startImportLockHeartbeat(collection importLockWriter, jobID string, logger *slog.Logger) func() {
+	done := make(chan struct{})
+	finished := make(chan struct{})
+
+	go func() {
+		defer close(finished)
+		ticker := time.NewTicker(importLockHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := updateImportLock(collection, "running", jobID); err != nil {
+					logger.Warn("Failed to refresh import lock", "error", err)
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	return func() {
+		close(done)
+		<-finished
+	}
 }
 
 func logSuccessfulDocIDs(logger *slog.Logger, docIDs []string, out io.Writer) {
@@ -337,54 +486,68 @@ func bucketReadyTimeout() time.Duration {
 	return time.Duration(parsed) * time.Second
 }
 
+// durabilityLevelFromEnv returns the DurabilityLevel to apply to each upsert.
+// DURABILITY_LEVEL can override the default of "majority" (none, majority,
+// majorityAndPersistOnMaster, persistToMajority).
+func durabilityLevelFromEnv(logger *slog.Logger) gocb.DurabilityLevel {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("DURABILITY_LEVEL")))
+	switch raw {
+	case "", "majority":
+		return gocb.DurabilityLevelMajority
+	case "none":
+		return gocb.DurabilityLevelNone
+	case "majorityandpersistonmaster":
+		return gocb.DurabilityLevelMajorityAndPersistOnMaster
+	case "persisttomajority":
+		return gocb.DurabilityLevelPersistToMajority
+	default:
+		logger.Warn("Invalid DURABILITY_LEVEL, using default", "value", raw, "default", "majority")
+		return gocb.DurabilityLevelMajority
+	}
+}
+
 // workerTask consumes document batches from jobs, enforces id-based keys,
-// performs a bulk upsert, and returns per-worker success/failure counters.
-func workerTask(collection *gocb.Collection, jobs <-chan []map[string]interface{}, logger *slog.Logger) (uint64, uint64, []string) {
+// upserts each document individually so DurabilityLevel can be enforced
+// (gocb's BulkOp API has no per-operation durability support), and returns
+// per-worker success/failure counters.
+func workerTask(collection *gocb.Collection, jobs <-chan []map[string]interface{}, durabilityLevel gocb.DurabilityLevel, logger *slog.Logger) (uint64, uint64, []string) {
 	var successCount, failCount uint64
+	var mu sync.Mutex
 	successfulDocIDs := []string{}
 
 	for batch := range jobs {
-		ops := make([]gocb.BulkOp, 0, len(batch))
-
-		// Build upsert operations for documents that contain a valid id field.
+		var batchWg sync.WaitGroup
 		for _, doc := range batch {
 			docID, ok := extractDocID(doc)
 			if !ok {
+				mu.Lock()
 				failCount++
+				mu.Unlock()
 				continue
 			}
 
-			ops = append(ops, &gocb.UpsertOp{
-				ID:    docID,
-				Value: doc,
-			})
-		}
+			batchWg.Add(1)
+			go func(docID string, doc map[string]interface{}) {
+				defer batchWg.Done()
 
-		if len(ops) == 0 {
-			logger.Debug("No valid documents in batch to process", "batchSize", len(batch))
-			continue
-		}
+				_, err := collection.Upsert(docID, doc, &gocb.UpsertOptions{
+					DurabilityLevel: durabilityLevel,
+					Context:         context.Background(),
+				})
 
-		// Execute one network call for all operations in the current batch.
-		err := collection.Do(ops, &gocb.BulkOpOptions{
-			Context: context.Background(),
-		})
-		if err != nil {
-			logger.Error("Bulk operation execution error", "batchSize", len(ops), "error", err)
+				mu.Lock()
+				defer mu.Unlock()
+				if err != nil {
+					logger.Debug("Document upsert failed", "docID", docID, "error", err)
+					failCount++
+				} else {
+					logger.Debug("Document upserted successfully", "docID", docID)
+					successfulDocIDs = append(successfulDocIDs, docID)
+					successCount++
+				}
+			}(docID, doc)
 		}
-
-		// Each operation carries its own result error.
-		for _, op := range ops {
-			upsertOp := op.(*gocb.UpsertOp)
-			if upsertOp.Err != nil {
-				logger.Debug("Document upsert failed", "docID", upsertOp.ID, "error", upsertOp.Err)
-				failCount++
-			} else {
-				logger.Debug("Document upserted successfully", "docID", upsertOp.ID)
-				successfulDocIDs = append(successfulDocIDs, upsertOp.ID)
-				successCount++
-			}
-		}
+		batchWg.Wait()
 	}
 
 	return successCount, failCount, successfulDocIDs
@@ -486,6 +649,7 @@ func parseFlagsFromArgs(args []string) (*Config, error) {
 	fs := flag.NewFlagSet("vximporter", flag.ContinueOnError)
 	fs.StringVar(&cfg.ConnStr, "conn", os.Getenv("VX_CREDENTIALS_FILE"), "Path to credentials YAML file (env: VX_CREDENTIALS_FILE)")
 	fs.StringVar(&cfg.FilePath, "file", "data.json", "Path to JSON array file")
+	fs.StringVar(&cfg.Collection, "collection", "", "Couchbase collection name")
 	fs.IntVar(&cfg.BatchSize, "batch-size", 500, "Documents per bulk request")
 	fs.IntVar(&cfg.NumWorkers, "workers", 8, "Number of concurrent goroutines")
 	if err := fs.Parse(args); err != nil {

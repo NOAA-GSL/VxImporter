@@ -31,6 +31,9 @@ go.work.sum
 # .idea/
 # .vscode/
 
+# macOS metadata
+.DS_Store
+
 # Local history artifacts
 .history/
 
