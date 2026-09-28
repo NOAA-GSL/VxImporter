@@ -3,17 +3,116 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/couchbase/gocb/v2"
 )
 
 // testLogger returns a discarding logger for tests to avoid output pollution.
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+type recordedImportLockWriter struct {
+	id    string
+	value map[string]interface{}
+	err   error
+}
+
+func (writer *recordedImportLockWriter) Upsert(id string, value interface{}, _ *gocb.UpsertOptions) (*gocb.MutationResult, error) {
+	writer.id = id
+	writer.value = value.(map[string]interface{})
+	return nil, writer.err
+}
+
+type recordedImportLockStore struct {
+	recordedImportLockWriter
+	status string
+}
+
+func (store *recordedImportLockStore) Get(_ string, _ *gocb.GetOptions) (*gocb.GetResult, error) {
+	return nil, gocb.ErrDocumentNotFound
+}
+
+func (store *recordedImportLockStore) Insert(id string, value interface{}, _ *gocb.InsertOptions) (*gocb.MutationResult, error) {
+	store.id = id
+	store.value = value.(map[string]interface{})
+	store.status = store.value["status"].(string)
+	return nil, store.err
+}
+
+func (store *recordedImportLockStore) Replace(id string, value interface{}, _ *gocb.ReplaceOptions) (*gocb.MutationResult, error) {
+	store.id = id
+	store.value = value.(map[string]interface{})
+	store.status = store.value["status"].(string)
+	return nil, store.err
+}
+
+func TestAcquireImportLock_InsertsWhenAbsent(t *testing.T) {
+	store := &recordedImportLockStore{}
+	if err := acquireImportLock(store, "vximporter:test:1"); err != nil {
+		t.Fatalf("acquireImportLock returned error: %v", err)
+	}
+	if store.id != importLockDocID || store.status != "running" {
+		t.Fatalf("unexpected lock write: id=%q status=%q", store.id, store.status)
+	}
+}
+
+func TestImportLockIsAvailable_RejectsActiveStatus(t *testing.T) {
+	if importLockIsAvailable("running") {
+		t.Fatal("expected running lock to be unavailable")
+	}
+	if !importLockIsAvailable("idle") {
+		t.Fatal("expected idle lock to be available")
+	}
+}
+
+func TestImportLockIsStale_UsesHeartbeatAge(t *testing.T) {
+	now := time.Unix(2_000_000, 0)
+	fresh := map[string]interface{}{"status": "running", "updated": float64(now.Unix() - int64(importLockStaleAfter.Seconds()) + 1)}
+	stale := map[string]interface{}{"status": "running", "updated": float64(now.Unix() - int64(importLockStaleAfter.Seconds()) - 1)}
+
+	if importLockIsStale(fresh, now) {
+		t.Fatal("expected fresh heartbeat to remain active")
+	}
+	if !importLockIsStale(stale, now) {
+		t.Fatal("expected old heartbeat to be stale")
+	}
+}
+
+func TestUpdateImportLock_WritesSharedLockDocument(t *testing.T) {
+	writer := &recordedImportLockWriter{}
+	if err := updateImportLock(writer, "running", "vximporter:test:1"); err != nil {
+		t.Fatalf("updateImportLock returned error: %v", err)
+	}
+
+	if writer.id != importLockDocID {
+		t.Fatalf("expected lock ID %q, got %q", importLockDocID, writer.id)
+	}
+	if writer.value["status"] != "running" {
+		t.Fatalf("expected running status, got %q", writer.value["status"])
+	}
+	if writer.value["job_id"] != "vximporter:test:1" {
+		t.Fatalf("unexpected job ID: %q", writer.value["job_id"])
+	}
+	if updated, ok := writer.value["updated"].(int64); !ok || updated <= 0 {
+		t.Fatalf("expected a positive Unix timestamp, got %v", writer.value["updated"])
+	}
+}
+
+func TestUpdateImportLock_ReturnsUpsertError(t *testing.T) {
+	want := fmt.Errorf("couchbase unavailable")
+	writer := &recordedImportLockWriter{err: want}
+	if err := updateImportLock(writer, "idle", "vximporter:test:1"); err != want {
+		t.Fatalf("expected %v, got %v", want, err)
+	}
 }
 
 func TestLogSuccessfulDocIDs_DebugPrettyPrints(t *testing.T) {
@@ -263,6 +362,7 @@ func TestParseFlagsFromArgs_Overrides(t *testing.T) {
 	cfg, err := parseFlagsFromArgs([]string{
 		"-conn", "/tmp/credentials-override.yaml",
 		"-file", "input.json",
+		"-collection", "override-collection",
 		"-batch-size", "1000",
 		"-workers", "16",
 	})
@@ -275,6 +375,9 @@ func TestParseFlagsFromArgs_Overrides(t *testing.T) {
 	}
 	if cfg.FilePath != "input.json" {
 		t.Fatalf("unexpected file value: %q", cfg.FilePath)
+	}
+	if cfg.Collection != "override-collection" {
+		t.Fatalf("unexpected collection value: %q", cfg.Collection)
 	}
 	if cfg.BatchSize != 1000 {
 		t.Fatalf("unexpected batch-size value: %d", cfg.BatchSize)
